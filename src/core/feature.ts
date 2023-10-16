@@ -1,8 +1,8 @@
 export function supportMSEH264Playback(): boolean {
   return (
-    // 浏览器是否支持 MediaSource API
+    // whether support MSE
     window.MediaSource &&
-    // 浏览器是否支持以下格式的媒体
+    // whether support specific type
     window.MediaSource.isTypeSupported(
       'video/mp4; codecs="avc1.42E01E,mp4a.40.2"'
     )

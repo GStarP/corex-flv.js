@@ -1,5 +1,6 @@
 import ts from '@rollup/plugin-typescript';
 import resolve from '@rollup/plugin-node-resolve';
+import nodePolyfills from 'rollup-plugin-polyfill-node';
 
 export default [
   {
@@ -9,6 +10,12 @@ export default [
       format: 'umd',
       name: 'flvjs',
     },
-    plugins: [ts(), resolve()],
+    plugins: [
+      ts(),
+      resolve(),
+      nodePolyfills({
+        include: ['events'],
+      }),
+    ],
   },
 ];

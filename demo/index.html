@@ -5,11 +5,23 @@
   </head>
 
   <body>
-    <div></div>
+    <div>
+      <video id="v"></video>
+    </div>
 
     <script src="../dist//flvjs.js"></script>
     <script>
-      console.log('flvjs.isSupported:', flvjs.isSupported());
+      if (flvjs.isSupported()) {
+        const el = document.getElementById('v');
+        const flvPlayer = flvjs.createPlayer({
+          type: 'flv',
+          url: 'http://localhost:52330/public/test.flv',
+        });
+        flvPlayer.attachMediaElement(el);
+        flvPlayer.load();
+      } else {
+        console.error('flv.js is not supported');
+      }
     </script>
   </body>
 </html>
