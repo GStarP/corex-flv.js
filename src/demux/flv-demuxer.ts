@@ -1,4 +1,5 @@
 import DemuxErrors from './demux-errors';
+import SPSParser from './sps-parser';
 
 /**
  * compose 4 8-bit to 1 32-bit
@@ -30,6 +31,7 @@ class FLVDemuxer {
   private _firstParse: boolean;
   private _dataOffset: number;
   private _littleEndian: boolean;
+  private _naluLengthSize: number;
 
   private _audioMetadata: AudioMetadata = {
     type: 'audio',
@@ -40,9 +42,42 @@ class FLVDemuxer {
     codec: '',
     refSampleDuration: 0,
   };
+  private _videoMetadata: VideoMetadata = {
+    type: 'video',
+    timescale: this._timescale,
+    duration: this._duration,
+    codecWidth: 0,
+    codecHeight: 0,
+    presentWidth: 0,
+    presentHeight: 0,
+    profile: '',
+    level: '',
+    bitDepth: 0,
+    chromaFormat: 0,
+    sarRatio: {
+      width: 0,
+      height: 0,
+    },
+    frameRate: {
+      fixed: true,
+      fps: 23.976,
+      fps_num: 23976,
+      fps_den: 1000,
+    },
+    refSampleDuration: 0,
+    codec: '',
+  };
+
   private _audioTrack: AudioTrack = {
     type: 'audio',
     id: 2,
+    sequenceNumber: 0,
+    samples: [],
+    length: 0,
+  };
+  private _videoTrack: VideoTrack = {
+    type: 'video',
+    id: 1,
     sequenceNumber: 0,
     samples: [],
     length: 0,
@@ -53,12 +88,15 @@ class FLVDemuxer {
     errorInfo: string
   ) => void = (t, i) => console.error('[corex] FlvDemuxer.onError', t, i);
 
-  onTrackMetadata: (type: 'audio', meta: AudioMetadata) => void = (t, m) =>
-    console.debug('[corex] FlvDemuxer.onTrackMetadata', t, m);
+  onTrackMetadata: <T extends TrackType>(type: T, meta: MetaData[T]) => void = (
+    t,
+    m
+  ) => console.debug('[corex] FlvDemuxer.onTrackMetadata', t, m);
 
   constructor(probeData: FlvProbeData) {
     this._dataOffset = probeData.dataOffset;
     this._firstParse = true;
+    this._naluLengthSize = 4;
 
     // LE is defined by platform, so test it
     let buf = new ArrayBuffer(2);
@@ -179,7 +217,7 @@ class FLVDemuxer {
 
       // Timestamp (3 bytes)
       // Timestamp Extended (1 byte)
-      // @TODO 2103 => 3210
+      // @TODO 2103 => 3210 not understand
       let ts2 = v.getUint8(4);
       let ts1 = v.getUint8(5);
       let ts0 = v.getUint8(6);
@@ -202,6 +240,13 @@ class FLVDemuxer {
           this._parseAudioData(chunk, dataOffset, dataSize, timestamp);
           break;
         case 9:
+          this._parseVideoData(
+            chunk,
+            dataOffset,
+            dataSize,
+            timestamp,
+            byteStart + offset
+          );
           break;
         case 18:
           break;
@@ -215,11 +260,6 @@ class FLVDemuxer {
 
       // tagBody + dataSize + prevTagSize
       offset += 11 + dataSize + 4;
-
-      console.debug(
-        '[corex] consume tag: ',
-        tagType === 8 ? 'audio' : tagType === 9 ? 'video' : 'script'
-      );
     }
 
     return offset;
@@ -339,13 +379,14 @@ class FLVDemuxer {
         track.samples.push(aacSample);
         track.length += data.length;
 
-        console.debug('[corex] parsed audio sample', aacSample);
+        // console.debug('[corex] parsed audio sample', aacSample);
       } else {
         console.error(`Flv: Unsupported AAC data type ${aacData.packetType}`);
       }
     }
     // @IGNORE now we only support AAC
   }
+
   private _parseAACAudioData(
     arrayBuffer: ArrayBuffer,
     dataOffset: number,
@@ -435,6 +476,349 @@ class FLVDemuxer {
       channelCount: channelConfig,
       codec: 'mp4a.40.' + audioObjectType,
     };
+  }
+
+  /**
+   * parse video data
+   * @REF https://rtmp.veriskope.com/pdf/video_file_format_spec_v10.pdf
+   */
+  private _parseVideoData(
+    arrayBuffer: ArrayBuffer,
+    dataOffset: number,
+    dataSize: number,
+    tagTimestamp: number,
+    tagPosition: number
+  ) {
+    // not enough data
+    if (dataSize <= 1) {
+      console.warn('Flv: Invalid video packet, missing VideoData payload!');
+      return;
+    }
+
+    // @IGNORE override hasVideo
+
+    // first 1 byte
+    let spec = new Uint8Array(arrayBuffer, dataOffset, dataSize)[0];
+    // Frame Type (4 bits)
+    // 1: key frame
+    // 2: I frame
+    // 5: video info / command frame
+    // 240 <-> 11110000
+    let frameType = (spec & 240) >>> 4;
+    // Codec ID (4 bits)
+    // 7: AVC
+    // 15 <-> 1111
+    let codecId = spec & 15;
+    if (codecId !== 7) {
+      this.onError(
+        DemuxErrors.CODEC_UNSUPPORTED,
+        `Flv: Unsupported codec in video frame: ${codecId}`
+      );
+      return;
+    }
+    this._parseAVCVideoPacket(
+      arrayBuffer,
+      dataOffset + 1,
+      dataSize - 1,
+      tagTimestamp,
+      tagPosition,
+      frameType
+    );
+  }
+
+  private _parseAVCVideoPacket(
+    arrayBuffer: ArrayBuffer,
+    dataOffset: number,
+    dataSize: number,
+    tagTimestamp: number,
+    tagPosition: number,
+    frameType: number
+  ) {
+    // not enough data
+    if (dataSize < 4) {
+      console.warn(
+        'Flv: Invalid AVC packet, missing AVCPacketType or/and CompositionTime'
+      );
+      return;
+    }
+
+    let le = this._littleEndian;
+    let v = new DataView(arrayBuffer, dataOffset, dataSize);
+
+    // Packet Type (1 byte)
+    // 0: sequence header
+    // 1: NALU
+    // 2: end of sequence
+    let packetType = v.getUint8(0);
+    // Composition Time (3 bytes)
+    // if packetType != 1 then 0
+    let cts_unsigned = v.getUint32(0, !le) & 0x00ffffff;
+    // convert to 24-bit signed int
+    let cts = (cts_unsigned << 8) >> 8;
+
+    if (packetType === 0) {
+      this._parseAVCDecoderConfigurationRecord(
+        arrayBuffer,
+        dataOffset + 4,
+        dataSize - 4
+      );
+    } else if (packetType === 1) {
+      this._parseAVCVideoData(
+        arrayBuffer,
+        dataOffset + 4,
+        dataSize - 4,
+        tagTimestamp,
+        tagPosition,
+        frameType,
+        cts
+      );
+    } else if (packetType === 2) {
+      // empty, AVC end of sequence
+    } else {
+      this.onError(
+        DemuxErrors.FORMAT_ERROR,
+        `Flv: Invalid video packet type ${packetType}`
+      );
+      return;
+    }
+  }
+
+  private _parseAVCDecoderConfigurationRecord(
+    arrayBuffer: ArrayBuffer,
+    dataOffset: number,
+    dataSize: number
+  ) {
+    // not enough data
+    if (dataSize < 7) {
+      console.warn('Flv: Invalid AVCDecoderConfigurationRecord, lack of data!');
+      return;
+    }
+
+    let meta = this._videoMetadata;
+    let track = this._videoTrack;
+
+    let le = this._littleEndian;
+    let v = new DataView(arrayBuffer, dataOffset, dataSize);
+
+    // @IGNORE override hasVideo
+    meta.type = 'video';
+    meta.timescale = this._timescale;
+    meta.duration = this._duration;
+
+    /**
+     * @REF https://ossrs.io/lts/zh-cn/assets/files/ISO_IEC_14496-15-AVC-format-2012-345a5b466cc73e978fd9dd0840361e8b.pdf
+     * 5.2.4.1.1
+     */
+    // configurationVersion (1 byte)
+    let version = v.getUint8(0);
+    // AVCProfileIndication (1 byte)
+    let avcProfile = v.getUint8(1);
+    // profile_compatibility (1 byte)
+    let profileCompatibility = v.getUint8(2);
+    // AVCLevelIndication (1 byte)
+    let avcLevel = v.getUint8(3);
+
+    if (version !== 1 || avcProfile === 0) {
+      this.onError(
+        DemuxErrors.FORMAT_ERROR,
+        'Flv: Invalid AVCDecoderConfigurationRecord'
+      );
+      return;
+    }
+
+    // Reserved (6 bits)
+    // lengthSizeMinusOne (2 bits)
+    this._naluLengthSize = (v.getUint8(4) & 3) + 1;
+    // _naluLengthSize should be 1/2/4
+    if (this._naluLengthSize !== 4) {
+      this.onError(
+        DemuxErrors.FORMAT_ERROR,
+        `Flv: Strange NaluLengthSizeMinusOne: ${this._naluLengthSize - 1}`
+      );
+      return;
+    }
+
+    // Reserved (3 bits)
+    // numOfSequenceParameterSets (5 bits)
+    // 31 <-> 11110
+    let spsCount = v.getUint8(5) & 31;
+    if (spsCount === 0) {
+      this.onError(
+        DemuxErrors.FORMAT_ERROR,
+        'Flv: Invalid AVCDecoderConfigurationRecord: No SPS'
+      );
+      return;
+    } else if (spsCount > 1) {
+      console.warn(
+        `Flv: Strange AVCDecoderConfigurationRecord: SPS Count = ${spsCount}`
+      );
+    }
+    // already parsed 6 bytes
+    let offset = 6;
+    for (let i = 0; i < spsCount; i++) {
+      // sequenceParameterSetLength (16 bits)
+      let len = v.getUint16(offset, !le);
+      offset += 2;
+
+      if (len === 0) {
+        continue;
+      }
+      // sequenceParameterSetNALUnit (${len} bytes)
+      let sps = new Uint8Array(arrayBuffer, dataOffset + offset, len);
+      offset += len;
+
+      // only reserve the first sps
+      if (i !== 0) {
+        continue;
+      }
+      let config = SPSParser.parseSPS(sps);
+      meta.codecWidth = config.codec_size.width;
+      meta.codecHeight = config.codec_size.height;
+      meta.presentWidth = config.present_size.width;
+      meta.presentHeight = config.present_size.height;
+
+      meta.profile = config.profile_string;
+      meta.level = config.level_string;
+      meta.bitDepth = config.bit_depth;
+      meta.chromaFormat = config.chroma_format;
+      meta.sarRatio = config.sar_ratio;
+      meta.frameRate = config.frame_rate;
+
+      // compute duration by frames
+      let fps_den = meta.frameRate.fps_den;
+      let fps_num = meta.frameRate.fps_num;
+      meta.refSampleDuration = meta.timescale * (fps_den / fps_num);
+
+      let codecArray = sps.subarray(1, 4);
+      let codecString = 'avc1.';
+      for (let j = 0; j < 3; j++) {
+        let h = codecArray[j].toString(16);
+        if (h.length < 2) {
+          h = '0' + h;
+        }
+        codecString += h;
+      }
+      meta.codec = codecString;
+
+      // @IGNORE media info
+    }
+
+    // numOfPictureParameterSets (1 byte)
+    let ppsCount = v.getUint8(offset);
+    if (ppsCount === 0) {
+      this.onError(
+        DemuxErrors.FORMAT_ERROR,
+        'Flv: Invalid AVCDecoderConfigurationRecord: No PPS'
+      );
+      return;
+    } else if (ppsCount > 1) {
+      console.warn(
+        `Flv: Strange AVCDecoderConfigurationRecord: PPS Count = ${ppsCount}`
+      );
+    }
+
+    offset++;
+    for (let i = 0; i < ppsCount; i++) {
+      // pictureParameterSetLength (16 bits)
+      let len = v.getUint16(offset, !le);
+      offset += 2;
+
+      if (len === 0) {
+        continue;
+      }
+
+      console.debug('Parsed AVCDecoderConfigurationRecord');
+      // pps is useless for extracting video information
+      // just skip
+      offset += len;
+    }
+
+    // @TODO _isInitialMetadataDispatched
+
+    this.onTrackMetadata('video', meta);
+  }
+
+  private _parseAVCVideoData(
+    arrayBuffer: ArrayBuffer,
+    dataOffset: number,
+    dataSize: number,
+    tagTimestamp: number,
+    tagPosition: number,
+    frameType: number,
+    cts: number
+  ) {
+    let le = this._littleEndian;
+    let v = new DataView(arrayBuffer, dataOffset, dataSize);
+
+    let units: NALUnit[] = [],
+      length = 0;
+
+    let offset = 0;
+    // set in _parseAVCDecoderConfigurationRecord
+    const lengthSize = this._naluLengthSize;
+
+    let dts = this._timestampBase + tagTimestamp;
+    let keyframe = frameType === 1;
+
+    while (offset < dataSize) {
+      // not enough data
+      if (offset + 4 >= dataSize) {
+        console.warn(
+          `Malformed Nalu near timestamp ${dts}, offset = ${offset}, dataSize = ${dataSize}`
+        );
+        break; // data not enough for next Nalu
+      }
+
+      /**
+       * NALU with length-header (AVC1)
+       * @REF https://blog.csdn.net/qq_15457239/article/details/100545520
+       */
+      let naluSize = v.getUint32(offset, !le);
+
+      // not enough data
+      if (naluSize > dataSize - lengthSize) {
+        console.warn(
+          `Malformed Nalus near timestamp ${dts}, NaluSize > DataSize!`
+        );
+        return;
+      }
+      // Unit Type (5 bits)
+      // 5: IDR
+      let unitType = v.getUint8(offset + lengthSize) & 0x1f;
+
+      if (unitType === 5) {
+        keyframe = true;
+      }
+
+      let data = new Uint8Array(
+        arrayBuffer,
+        dataOffset + offset,
+        lengthSize + naluSize
+      );
+      let unit = { type: unitType, data: data };
+      units.push(unit);
+      length += data.byteLength;
+      offset += lengthSize + naluSize;
+    }
+
+    if (units.length > 0) {
+      let track = this._videoTrack;
+      let avcSample: AVCSample = {
+        units: units,
+        length: length,
+        isKeyframe: keyframe,
+        dts: dts,
+        cts: cts,
+        pts: dts + cts,
+      };
+      if (keyframe) {
+        avcSample.filePosition = tagPosition;
+      }
+      track.samples.push(avcSample);
+      track.length += length;
+
+      // console.debug('[corex] parsed video sample', avcSample);
+    }
   }
 }
 

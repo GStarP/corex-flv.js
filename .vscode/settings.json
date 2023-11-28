@@ -4,6 +4,7 @@
     "DEMUX",
     "demuxer",
     "msectl",
+    "NALU",
     "remuxer",
     "transmuxer",
     "Transmuxing"
